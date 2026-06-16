@@ -1,76 +1,136 @@
 <?php
-require_once __DIR__ . '/includes/csrf.php';
-csrf_start();
-require_once __DIR__ . '/includes/reviews.php';
-require_once __DIR__ . '/includes/config.php';
-require_once __DIR__ . '/includes/site_data.php';
-require_once __DIR__ . '/includes/layout.php';
-$pageTitle = 'Отзывы клиентов — ' . APP_NAME;
-$pageDescription = 'Отзывы клиентов о сервисе ремонта бытовой техники в Алматы.';
-$bodyClass = 'page-reviews';
-require_once __DIR__ . '/includes/header.php';
+declare(strict_types=1);
 
-$errors = [];
-$ok = false;
+function reviews_storage_path(): string {
+  return __DIR__ . '/../storage/reviews.json';
+}
 
-if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST') {
-  if (!csrf_verify($_POST['csrf'] ?? '')) $errors[] = 'Обновите страницу и попробуйте снова.';
-  $name = trim((string)($_POST['name'] ?? ''));
-  $rating = (int)($_POST['rating'] ?? 5);
-  $text = trim((string)($_POST['text'] ?? ''));
-  if ($name === '' || strlen($name) < 2) $errors[] = 'Введите имя.';
-  if ($rating < 1 || $rating > 5) $errors[] = 'Выберите оценку от 1 до 5.';
-  if ($text === '' || strlen($text) < 8) $errors[] = 'Напишите отзыв подробнее.';
-  if (!$errors) {
-    $ok = reviews_add($name, $rating, $text);
-    if (!$ok) $errors[] = 'Не удалось сохранить отзыв. Попробуйте позже или свяжитесь с нами по телефону.';
+function reviews_new_id(): string {
+  if (function_exists('random_bytes')) return bin2hex(random_bytes(6)) . '-' . (string)time();
+  return (string)mt_rand(100000, 999999) . '-' . (string)time();
+}
+
+function reviews_cut(string $value, int $limit): string {
+  $value = trim($value);
+  if (function_exists('mb_strlen') && function_exists('mb_substr')) {
+    return mb_strlen($value) > $limit ? mb_substr($value, 0, $limit) : $value;
+  }
+  return strlen($value) > $limit ? substr($value, 0, $limit) : $value;
+}
+
+function reviews_normalize_item(array $it): array {
+  $it['id'] = (string)($it['id'] ?? reviews_new_id());
+  $it['name'] = reviews_cut((string)($it['name'] ?? 'Клиент'), 60);
+  $it['rating'] = max(1, min(5, (int)($it['rating'] ?? 5)));
+  $it['text'] = reviews_cut((string)($it['text'] ?? ''), 700);
+  $it['reply'] = reviews_cut((string)($it['reply'] ?? ''), 700);
+  $status = (string)($it['status'] ?? 'done');
+  $it['status'] = in_array($status, ['new','in_work','done'], true) ? $status : 'new';
+  $it['created_at'] = (string)($it['created_at'] ?? date('Y-m-d H:i:s'));
+  $it['updated_at'] = (string)($it['updated_at'] ?? $it['created_at']);
+  return $it;
+}
+
+function reviews_load(): array {
+  $path = reviews_storage_path();
+  if (!file_exists($path)) return [];
+  $raw = file_get_contents($path);
+  if ($raw === false) return [];
+  $data = json_decode($raw, true);
+  if (!is_array($data)) return [];
+
+  $items = [];
+  foreach ($data as $it) {
+    if (is_array($it)) $items[] = reviews_normalize_item($it);
+  }
+  usort($items, function($a, $b) {
+    return strcmp((string)($b['created_at'] ?? ''), (string)($a['created_at'] ?? ''));
+  });
+  return $items;
+}
+
+function reviews_save(array $items): bool {
+  $path = reviews_storage_path();
+  $dir = dirname($path);
+  if (!is_dir($dir)) @mkdir($dir, 0775, true);
+  $items = array_values(array_map('reviews_normalize_item', $items));
+  $json = json_encode($items, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
+  if ($json === false) return false;
+
+  $fp = fopen($path, 'c+');
+  if (!$fp) return false;
+  try {
+    if (!flock($fp, LOCK_EX)) return false;
+    ftruncate($fp, 0);
+    rewind($fp);
+    fwrite($fp, $json);
+    fflush($fp);
+    flock($fp, LOCK_UN);
+    return true;
+  } finally {
+    fclose($fp);
   }
 }
-$items = reviews_public();
-render_site_header('reviews');
-?>
-<main>
-  <section class="pageLead">
-    <div class="container pageLead__grid">
-      <div>
-        <span class="sectionLabel">Отзывы</span>
-        <h1>Отзывы клиентов</h1>
-        <p>Мы публикуем отзывы клиентов после проверки и отвечаем на обращения. Ваш отзыв поможет другим людям выбрать мастера.</p>
-        <div class="pageActions"><button class="primaryButton" type="button" data-open-modal data-service="Вызов мастера после просмотра отзывов">Вызвать мастера</button><a class="ghostButton" href="client/index.php">Моя заявка</a></div>
-      </div>
-      <div class="pageLead__card"><b><?= count($items) ?></b><span>Опубликованных отзывов на сайте после модерации.</span></div>
-    </div>
-  </section>
 
-  <section class="section">
-    <div class="container reviewsPageGrid">
-      <div class="contentPanel">
-        <h2>Оставить отзыв</h2>
-        <p>После проверки отзыв появится на сайте.</p>
-        <?php if ($ok): ?><div class="notice notice--ok">Спасибо! Отзыв отправлен на проверку.</div><?php endif; ?>
-        <?php if ($errors): ?><div class="notice notice--bad"><b>Исправьте:</b><ul><?php foreach ($errors as $e): ?><li><?= htmlspecialchars($e) ?></li><?php endforeach; ?></ul></div><?php endif; ?>
-        <form method="post" class="reviewForm">
-          <input type="hidden" name="csrf" value="<?= htmlspecialchars(csrf_token(), ENT_QUOTES) ?>">
-          <label>Имя<input name="name" placeholder="Например: Алия" required></label>
-          <label>Оценка<select name="rating" required><option value="5">★★★★★ 5</option><option value="4">★★★★☆ 4</option><option value="3">★★★☆☆ 3</option><option value="2">★★☆☆☆ 2</option><option value="1">★☆☆☆☆ 1</option></select></label>
-          <label>Текст<textarea name="text" rows="5" placeholder="Опишите качество работы" required></textarea></label>
-          <button class="primaryButton" type="submit">Отправить отзыв</button>
-        </form>
-      </div>
+function reviews_add($nameOrData, ?int $rating = null, ?string $text = null): bool {
+  if (is_array($nameOrData)) {
+    $data = $nameOrData;
+  } else {
+    $data = [
+      'name' => (string)$nameOrData,
+      'rating' => (int)($rating ?? 5),
+      'text' => (string)($text ?? ''),
+      'reply' => '',
+      'status' => 'new',
+    ];
+  }
+  $data['id'] = $data['id'] ?? reviews_new_id();
+  $data['created_at'] = $data['created_at'] ?? date('Y-m-d H:i:s');
+  $data['updated_at'] = date('Y-m-d H:i:s');
 
-      <div class="reviewsListStack">
-        <?php if (!$items): ?><div class="contentPanel"><h2>Пока нет отзывов</h2><p>Первый опубликованный отзыв появится здесь.</p></div><?php endif; ?>
-        <?php foreach ($items as $r): ?>
-          <?php $rating = max(1,min(5,(int)($r['rating'] ?? 5))); ?>
-          <article class="reviewCard">
-            <div class="reviewTop"><b><?= htmlspecialchars($r['name'] ?? 'Клиент') ?></b><span><?= str_repeat('★',$rating) ?><?= str_repeat('☆',5-$rating) ?></span></div>
-            <p><?= nl2br(htmlspecialchars($r['text'] ?? '')) ?></p>
-            <?php if (!empty($r['reply'])): ?><div class="reply"><b>Ответ сервиса:</b><span><?= nl2br(htmlspecialchars($r['reply'])) ?></span></div><?php endif; ?>
-            <small><?= htmlspecialchars($r['created_at'] ?? '') ?> • Алматы</small>
-          </article>
-        <?php endforeach; ?>
-      </div>
-    </div>
-  </section>
-</main>
-<?php render_site_footer($services); render_lead_modal(); require_once __DIR__ . '/includes/footer.php'; ?>
+  $items = reviews_load();
+  $items[] = reviews_normalize_item($data);
+  $items = array_slice($items, -400);
+  return reviews_save($items);
+}
+
+function reviews_update(string $id, array $fields): bool {
+  $items = reviews_load();
+  $changed = false;
+  foreach ($items as &$it) {
+    if ((string)$it['id'] === (string)$id) {
+      foreach (['name','rating','text','reply','status'] as $k) {
+        if (array_key_exists($k, $fields)) $it[$k] = $fields[$k];
+      }
+      $it['updated_at'] = date('Y-m-d H:i:s');
+      $it = reviews_normalize_item($it);
+      $changed = true;
+      break;
+    }
+  }
+  unset($it);
+  return $changed ? reviews_save($items) : false;
+}
+
+function reviews_delete(string $id): bool {
+  $items = reviews_load();
+  $before = count($items);
+  $items = array_values(array_filter($items, function($it) use ($id) {
+    return (string)($it['id'] ?? '') !== (string)$id;
+  }));
+  return count($items) !== $before ? reviews_save($items) : false;
+}
+
+function reviews_public(): array {
+  return array_values(array_filter(reviews_load(), function($it) {
+    return ($it['status'] ?? '') === 'done';
+  }));
+}
+
+function reviews_all($status = null): array {
+  $all = reviews_load();
+  if (!$status || $status === 'all') return $all;
+  return array_values(array_filter($all, function($it) use ($status) {
+    return ($it['status'] ?? 'new') === $status;
+  }));
+}
